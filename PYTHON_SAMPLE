@@ -1,0 +1,685 @@
+#####################################################################################
+## author: Njoki KAHIU, ILRI		     										   ##
+## Date: February 27th 2020														   ##
+## Updated: 28th May 2020 
+## Script to:							  										   ##
+## i) Extract LAI and QA files from Combined MODIS terra and AQUA HDF  files:  MCD15A2H##																	 ##	
+##ii)Get real LAI/QC values 
+## iii) Smooth the LAI data
+## iv) Partition into components of woody and herbaceous 
+#####################################################################################	
+try:
+    from osgeo import gdal
+    from osgeo.gdalconst import *
+    gdal.TermProgress = gdal.TermProgress_nocb
+except ImportError:
+    import gdal
+    from gdalconst import *
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import interpolate
+from scipy.interpolate import interp1d
+import pandas as pd
+from scipy.signal import find_peaks# as fp
+from scipy.interpolate import CubicSpline
+from scipy import signal
+import os
+import glob 
+import math
+import time
+import sys
+import datetime
+from calendar import monthrange
+from tqdm import tqdm 
+import itertools 
+import click
+import warnings
+import urllib.request
+from contextlib import closing
+import requests
+import urllib
+import rasterio
+import fiona
+from rasterio.merge import merge
+from rasterio.plot import show
+import progressbar
+from rasterio.plot import show_hist
+from rasterio.mask import mask
+from shapely.geometry import box
+import geopandas as gpd
+from fiona.crs import from_epsg
+import zipfile as unzip
+import matplotlib
+from shapely.geometry import mapping
+from rasterio.plot import plotting_extent
+from rasterstats import zonal_stats
+import warnings
+import earthpy.spatial as es
+import earthpy.plot as ep
+from numpy import *
+from pylab import *
+import scipy.optimize.lbfgsb as lbfgsb
+import numpy.linalg
+from scipy.fftpack.realtransforms import dct,idct
+import numpy.ma as ma
+
+#execfile("C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/smoothn.py") ## Smoothing function
+smoothFUNC = "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/smoothn.py"
+#%run "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/KahiuMN_XtractHDF.Smooth.Partition.LAI.2020528.py"
+#from smoothFUNC import *
+
+HDFolder = "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/HDFS/"
+LAIfolder = "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/TIFFS/"
+tmpdirtry = "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/tmp/"
+os.chdir(HDFolder)
+
+clp = "C:/MNKAHIU/RESEARCHPAPERS/PEER/KEN.XTENT.SINUS.shp"
+wcovfile = "C:/MNKAHIU/RESEARCHPAPERS/PEER/WOODCOVER/WC.AFRICA.SINUS.500m.tif"
+precfile = "C:/MNKAHIU/RESEARCHPAPERS/PEER/PRECIP/CHIRPS.AFRICA.1990_2019.SINUS.500m.tif"
+log = None
+
+##########################################################################################################################################
+def write_log(logstatus, logstring):
+	timestamp = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime())
+	log.write("%s %s %s\n" % (timestamp, logstatus, logstring))
+
+#################################################################################################################################
+HDFfiles = glob.glob (HDFolder + "MCD15A2H.A20?????.h??v??.006.*.hdf")
+Years = [str(y) for y in np.unique([y[55:59] for y in HDFfiles])]
+Dates = [str(d) for d in np.unique([d[55:62] for d in HDFfiles])]
+outrefKENYA = "C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/MCD15A2H.KENYA.EXTENT.tif" ##Reference LAI file for Kenya extent
+##########################################################################################################################################
+## Function for extracting data from HDF file format and processing the quality flags
+##########################################################################################################################################
+
+## Function for processing the quality flags
+def qualityMASK (readQC):
+	MASK = readQC
+	for ival in range(readQC.shape[1]):
+		irowQC = [int(i) for i in readQC[ival, ]]
+		irowQC  = [format(j, "b").zfill(8) for j in irowQC]
+		irowMASK = irowQC
+		for ps in range(len(irowQC)):
+			ls = irowQC[ps]
+			#if ls[5:8]=="000":
+			if ls[3:5]=="00": #and ls[5:7]!="00": #if ls[0]=="0" and ls[2]=="0" and ls[3:5]=="00" and ls[5:8]!="100":
+				irowMASK[ps] = 1
+			else:
+				irowMASK[ps] = np.nan
+		MASK[ival, ] = irowMASK
+	return (MASK)
+
+## Function for accessing HDF files data to generate the QC filtered data
+def qcFILTERING (inHDF, outfolder, driver="GTiff", suffx="test.hqLAI"):
+	if not os.path.exists(outfolder):
+		os.mkdir(outfolder)
+	#print(inHDF)
+	Openhdf = gdal.Open(inHDF, GA_ReadOnly)
+	sdsets = Openhdf.GetSubDatasets()
+	fname = outfolder + os.path.basename(inHDF)[0:29] + suffx + ".tif"
+	laifile = gdal.Open(sdsets[1][0], gdal.GA_ReadOnly)
+	qcflags = gdal.Open(sdsets[2][0], gdal.GA_ReadOnly)
+	cols = laifile.RasterXSize
+	rows = laifile.RasterYSize
+	gs = laifile.GetGeoTransform()
+	srs = laifile.GetProjectionRef()
+	driver = gdal.GetDriverByName(driver)
+	outRAS = driver.Create(fname, cols, rows,1, gdal.GDT_Float32)
+	outRAS.SetGeoTransform(gs)
+	outRAS.SetProjection(srs)
+	binQC = qcflags.ReadAsArray()
+	binQC = np.where(binQC>254,np.nan,binQC)
+	maskQC = qualityMASK (readQC = binQC)
+	laiRAS = laifile.ReadAsArray()
+	laiRAS = np.where(laiRAS>100, np.nan, laiRAS)#*0.1)
+	hqcLAI = laiRAS*maskQC
+	try:
+		outRAS.GetRasterBand(1).WriteArray(hqcLAI.astype(np.float32))
+		outRAS = None
+	except Exception as e:
+		write_log("ERROR", "SOMETHING WRONG WITH WRITING RASTER")
+		return None
+	return fname
+	
+## Opening the HDF and subsetting the data
+def crophqLAI (hdfDIR, hdfPattern, tmpDIR=tmpdirtry , clippingExtent=clp):
+	XTENT = gpd.read_file(clippingExtent)
+	flist = glob.glob(hdfDIR + "MCD15A2H.A" +  hdfPattern + "*.006.*.hdf")
+	outLST = []
+	rasLST = []
+	for ifile in range(len(flist)):
+		fl = qcFILTERING (inHDF=flist[ifile], outfolder=tmpDIR, driver="GTiff", suffx="hqLAI")
+		openras = rasterio.open(fl)
+		outLST.append(fl)
+		rasLST.append(openras)
+	outnamsk = outLST[0][0:62]+ "mosaicKENYA.006.tif"
+	mosaic, outtrans = merge(rasLST)
+	metads = openras.meta.copy()
+	metads.update({"driver": "GTiff", "height": mosaic.shape[1],"width": mosaic.shape[2],"transform": outtrans,"crs": "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +a=6371007.181 +b=6371007.181 +units=m +no_defs"})
+	with rasterio.open(outnamsk, "w", **metads) as dest:
+		dest.write(mosaic)
+	crop_band, crop_meta = es.crop_image(rasterio.open(outnamsk), XTENT)
+	outds = crop_band[0,:,:].ravel()
+	outLST.append(outnamsk)
+	rasLST = None
+	openras.close()
+	return outds, outLST 
+
+## Looping function for year by year HDF files processing 
+def readingDATES (fldates, Folder = HDFolder, refras=outrefKENYA, tmpDIR=tmpdirtry, clippingExtent=clp):
+	dim = rasterio.open(refras).read(1).shape
+	ysize = dim[0]
+	xsize = dim[1]
+	npixels = xsize*ysize
+	rawLAI = np.float32(np.empty(shape =(npixels,0)))
+	toDELETE = []
+	click.secho('\n' +  ' ***** EXTRACT HDF, MOSAIC, CLIP & FILTER with HQC FLAGS', bold=True) ##Open status bar
+	for d in tqdm(range(len(fldates))):
+		outDATA, deltd = crophqLAI (hdfDIR=Folder, hdfPattern=fldates[d], tmpDIR=tmpDIR , clippingExtent=clippingExtent)
+		toDELETE.extend(deltd)
+		#dltd = [y for x in toDELETE for y in x]
+		#dltd = [os.remove(ff) for ff in dltd]
+		#dltd = [os.remove(ff) for ff in toDELETE]
+		rawLAI = np.column_stack((rawLAI,outDATA))
+	return rawLAI, toDELETE
+
+######################################################################################################################################
+## LAI smoothing Functions 
+######################################################################################################################################
+
+##This function filters data based on a window size to remove low LAI values if they fall below a certain quantile range
+def	upperPROFILE(indata, wndw=3, xpctdiff=1, qntl=0.75):
+	rwcls = len(indata)
+	trpld = np.array((indata, indata,indata)).ravel()
+	ncl = len(trpld)
+	msg = len(trpld[np.isnan(trpld)])
+	#trpld[np.isnan(trpld)]= -100
+	crctd = np.zeros((ncl))
+	for i in range(ncl):
+		if round((msg/ncl),2)>0.25:
+			crctd = trpld
+		elif i >wndw and (ncl-i)>=wndw:
+			stat = np.nanquantile(trpld[(i-wndw):(i+wndw)],q=qntl)#, axis =1)
+			#as.numeric(quantile(trpld[(i-wndw):(i+wndw)], qntl, na.rm=TRUE))
+			dfce = round((trpld[i]/stat), 1)# median(trpld[(i-wndw):(i+wndw)], na.rm=TRUE),1)
+			if dfce>=xpctdiff:
+				crctd[i] = trpld[i]
+			else:
+				crctd[i] = np.nan
+		else:
+			crctd[i] = trpld[i]
+	outds = crctd[(rwcls):(rwcls*2)]
+	outds[outds<0] = np.nan
+	outds= np.where(outds==0, indata, outds)
+	return outds
+
+############################################################################################################
+#%run C:/MNKAHIU/RESEARCHPAPERS/PEER/MCD15A2H/smoothn.py ## import the SMOOTHN function 
+def smoothingDATA(inarray, window=3, expctdiffce=1, quantyl=0.75):
+	#exec(smoothnFILTER)## import the SMOOTHN function 
+	cols = int(inarray.shape[0])
+	smoothedLAI =  np.zeros((cols))
+	mnds = np.nanmin(inarray)			
+	if pd.isnull(inarray).all()==True:
+		smoothedLAI = inarray
+	else:
+		bised = upperPROFILE(indata=inarray, wndw = window, xpctdiff=expctdiffce, qntl=quantyl)
+		tripled = np.array((bised, bised,bised)).ravel()
+		yp = pd.Series(tripled)
+		yp = yp.interpolate(limit_direction='both', kind='cubic')
+		try:
+			smtd = SMOOTHN(yp.ravel(),smoothOrder=2.0, isrobust=True)[0]
+			smtd = np.where(smtd<mnds, mnds, smtd)
+			smtd = signal.savgol_filter(smtd,13,3)
+			smtd = np.where(smtd<mnds, mnds, smtd)
+			smtd = smtd[cols:(2*cols)]
+			smvals = round(float(len(np.unique(smtd)))/float(len(inarray)),2)
+			if smvals<=0.5:
+				sglay = signal.savgol_filter(yp,13,3)
+				sglay = np.where(sglay<mnds, mnds, sglay)
+				sglay = sglay[cols:(2*cols)]
+				smoothedLAI = sglay
+			else: 
+				smoothedLAI = smtd
+		except ValueError:
+			pass
+	return smoothedLAI
+##############################################################################################################
+## LAI Partitioning processing 
+##############################################################################################################
+
+##Extract the maximum possible LAI within an area
+def incanopyPARAMETERS (wcfile=wcovfile, prfile=precfile,greenUp=8/float(14)):
+	PRECIP = gdal.Open(prfile, gdal.GA_ReadOnly).ReadAsArray().ravel()
+	npix = int(PRECIP.shape[0])
+	canopyLAI = np.zeros((npix)) 
+	PRECIP = np.where(PRECIP<101, np.nan, PRECIP)
+	WCov  = gdal.Open(wcfile, gdal.GA_ReadOnly).ReadAsArray().ravel()
+	WCov  = np.where(WCov<0, np.nan, WCov*0.01)
+    click.secho('\nEXTRACTING CANOPY LAI', bold=True) ##Open status bar
+	for ipix in tqdm(range(npix)):
+		canopyLAI[ipix]=max(1,min(6.4,PRECIP[ipix]*0.0031+0.2286))
+	LAIwmax = np.multiply(canopyLAI,WCov)
+	TreeChange = np.multiply(LAIwmax,greenUp)
+	return (LAIwmax, TreeChange)
+	
+##Partitioning Function
+def PartitionLAI (irowLAI,incanopyLAI,tchange):
+	ncls = len(irowLAI)
+	tLAI = np.zeros((ncls)) ##Tree LAI
+	gLAI = np.zeros((ncls)) ## Grass LAI
+	for ipix in range(ncls):
+		if np.isnan(irowLAI[ipix])|np.isnan(incanopyLAI):
+			tLAI[ipix]=np.nan
+			gLAI[ipix]=np.nan
+		elif irowLAI[ipix]<=incanopyLAI and ipix>0:
+			prevsLAI = irowLAI[ipix-1]
+			tLAI[ipix] = min(irowLAI[ipix], prevsLAI + tchange)
+			gLAI[ipix] = 0
+		elif irowLAI[ipix]<=incanopyLAI:
+			tLAI[ipix] = irowLAI[ipix]
+			gLAI[ipix] = 0
+		else: 
+			tLAI[ipix] = incanopyLAI
+			gLAI[ipix]= irowLAI[ipix] - tLAI[ipix]
+		tLAI = np.where(np.isnan(tLAI),-100,tLAI)
+		gLAI = np.where(np.isnan(gLAI),-100,gLAI)
+	return tLAI, gLAI
+##########################################################################################################################################
+## Saving the processed Data Functions; Looping over files for saving 
+##############################################################################################################
+
+## Looping over files for saving 
+def saveFILES(processDATA, flistnames ,folder, index = "smoothLAI.tif", refras=outrefKENYA):
+	readREF = rasterio.open(refras)
+	ysize = readREF.read(1).shape[0]
+	xsize = readREF.read(1).shape[1]
+	metads = readREF.meta
+	nfiles = int(processDATA.shape[1])
+	for ifile in range(nfiles):
+		dataset = np.reshape(processDATA[:,ifile], readREF.read(1).shape)
+		dataset = np.where(np.isnan(dataset), -100, dataset)
+		dataset = np.float32(dataset)
+		outfile = "%s%s.%s"%(folder, ("MCD15A2H.A" + flistnames[ifile]+ ".KENYA"),index)
+		print (outfile)
+		with rasterio.open(outfile, "w", **metads) as destfile:
+			destfile.write(dataset,1)
+	return None
+
+####################################################################################################################################################################################################################################################################################
+
+##########################################################################################################################################
+## Smoothing Function
+##########################################################################################################################################
+
+def SMOOTHN (y,nS0=10,axis=None,smoothOrder=2.0,sd=None,verbose=False,\
+	s0=None,z0=None,isrobust=False,W=None,s=None,MaxIter=100,TolZ=1e-3,weightstr='bisquare'):
+  if type(y) == ma.core.MaskedArray:  # masked array
+    is_masked = True
+    mask = y.mask
+    y = np.array(y)
+    y[mask] = 0.
+    if W != None:
+      W  = np.array(W)
+      W[mask] = 0.
+    if sd != None:
+      W = np.array(1./sd**2)
+      W[mask] = 0.
+      sd = None
+    y[mask] = np.nan    
+  if sd != None:
+    sd_ = np.array(sd)
+    mask = (sd > 0.)
+    W = np.zeros_like(sd_)
+    W[mask] = 1./sd_[mask]**2
+    sd = None
+  if W != None:
+    W = W/W.max()
+  sizy = y.shape;
+  # sort axis
+  if axis == None:
+    axis = tuple(np.arange(y.ndim))
+  noe = y.size # number of elements
+  if noe<2:
+    z = y
+    exitflag = 0;Wtot=0
+    return z,s,exitflag,Wtot
+  # Smoothness parameter and weights
+  if W == None:
+    W = ones(sizy);
+  # "Weighting function" criterion
+  weightstr = weightstr.lower()
+  IsFinite = np.array(isfinite(y)).astype(bool);
+  nof = IsFinite.sum() # number of finite elements
+  W = W*IsFinite;
+  if any(W<0):
+    error('smoothn:NegativeWeights',\
+        'Weights must all be >=0')
+  else:
+      pass
+  # Weighted or missing data?
+  isweighted = any(W != 1);
+  # Robust smoothing?isrobust
+  isauto = not s;
+  try:
+    from scipy.fftpack.realtransforms import dct,idct
+  except:
+    z = y
+    exitflag = -1;Wtot=0
+    return z,s,exitflag,Wtot
+  axis = tuple(np.array(axis).flatten())
+  d =  y.ndim;
+  Lambda = zeros(sizy);
+  for i in axis:
+    siz0 = ones((1,y.ndim))[0];
+    siz0[i] = sizy[i];
+    Lambda = Lambda + (cos(pi*(arange(1,sizy[i]+1) - 1.)/sizy[i]).reshape(int(siz0)))
+  Lambda = -2.*(len(axis)-Lambda);
+  if not isauto:
+    Gamma = 1./(1+(s*abs(Lambda))**smoothOrder);
+  N = sum(array(sizy) != 1); # tensor rank of the y-array
+  hMin = 1e-6; hMax = 0.99;
+  try:
+    sMinBnd = np.sqrt((((1+sqrt(1+8*hMax**(2./N)))/4./hMax**(2./N))**2-1)/16.);
+    sMaxBnd = np.sqrt((((1+sqrt(1+8*hMin**(2./N)))/4./hMin**(2./N))**2-1)/16.);
+  except:
+    sMinBnd = None
+    sMaxBnd = None
+  ## Initialize before iterating
+  Wtot = W;
+  #--- Initial conditions for z
+  if isweighted:
+    if z0 != None: # an initial guess (z0) has been provided
+        z = z0;
+    else:
+        z = y #InitialGuess(y,IsFinite);
+        z[~IsFinite] = 0.
+  else:
+    z = zeros(sizy);
+  z0 = z;
+  y[~IsFinite] = 0; # arbitrary values for missing y-data
+  tol = 1.;
+  RobustIterativeProcess = True;
+  RobustStep = 1;
+  nit = 0;
+  errp = 0.1;
+  RF = 1 + 0.75*isweighted;
+  if isauto:
+    try:
+      xpost = array([(0.9*log10(sMinBnd) + log10(sMaxBnd)*0.1)])
+    except:
+      array([100.])
+  else:
+    xpost = array([log10(s)])
+  while RobustIterativeProcess:
+    aow = sum(Wtot)/noe;
+    while tol>TolZ and nit<MaxIter:
+        if verbose:
+          print ('tol',tol,'nit',nit)
+        nit = nit+1;
+        DCTy = dctND(Wtot*(y-z)+z,f=dct);
+        if isauto and not remainder(log2(nit),1):
+            if not s0:
+              ss = np.arange(nS0)*(1./(nS0-1.))*(log10(sMaxBnd)-log10(sMinBnd))+ log10(sMinBnd)
+              g = np.zeros_like(ss)
+              for i,p in enumerate(ss):
+                g[i] = gcv(p,Lambda,aow,DCTy,IsFinite,Wtot,y,nof,noe,smoothOrder)
+              xpost = [ss[g==g.min()]]
+            else:
+              xpost = [s0]
+            xpost,f,d = lbfgsb.fmin_l_bfgs_b(gcv,xpost,fprime=None,factr=10.,\
+               approx_grad=True,bounds=[(log10(sMinBnd),log10(sMaxBnd))],\
+               args=(Lambda,aow,DCTy,IsFinite,Wtot,y,nof,noe,smoothOrder))
+        s = 10**xpost[0];
+        s0 = xpost[0]
+        Gamma = 1./(1+(s*abs(Lambda))**smoothOrder);
+        z = RF*dctND(Gamma*DCTy,f=idct) + (1-RF)*z;
+        tol = isweighted*norm(z0-z)/norm(z);
+        z0 = z; # re-initialization
+    exitflag = nit<MaxIter;
+    if isrobust: #-- Robust Smoothing: iteratively re-weighted process
+        h = sqrt(1+16.*s); 
+        h = sqrt(1+h)/sqrt(2)/h; 
+        h = h**N;
+        Wtot = W*RobustWeights(y-z,IsFinite,h,weightstr);
+        isweighted = True; tol = 1; nit = 0; 
+        RobustStep = RobustStep+1;
+        RobustIterativeProcess = RobustStep<3; # 3 robust steps are enough.
+    else:
+        RobustIterativeProcess = False; # stop the whole process
+  if isauto:
+    if abs(log10(s)-log10(sMinBnd))<errp:
+        warning('MATLAB:smoothn:SLowerBound',\
+            ['s = %.3f '%(s) + ': the lower bound for s '\
+            + 'has been reached. Put s as an input variable if required.'])
+    elif abs(log10(s)-log10(sMaxBnd))<errp:
+        warning('MATLAB:smoothn:SUpperBound',\
+            ['s = %.3f '%(s) + ': the upper bound for s '\
+            + 'has been reached. Put s as an input variable if required.'])
+
+  return z,s,exitflag,Wtot
+
+##Njoki Kahiu Date 18th March 2020, altered this warning to prevent the programme from printing the warnings on the screen  
+def warning(s1,s2):
+	return None
+###################################################################
+def gcv(p,Lambda,aow,DCTy,IsFinite,Wtot,y,nof,noe,smoothOrder):
+    s = 10**p;
+    Gamma = 1./(1+(s*abs(Lambda))**smoothOrder);
+    if aow>0.9: # aow = 1 means that all of the data are equally weighted
+        RSS = norm(DCTy*(Gamma-1.))**2;
+    else:
+        yhat = dctND(Gamma*DCTy,f=idct);
+        RSS = norm(sqrt(Wtot[IsFinite])*(y[IsFinite]-yhat[IsFinite]))**2;
+    TrH = sum(Gamma);
+    GCVscore = RSS/float(nof)/(1.-TrH/float(noe))**2;
+    return GCVscore
+
+## Robust weights; function W = RobustWeights(r,I,h,wstr)
+def RobustWeights(r,I,h,wstr):
+    MAD = median(abs(r[I]-median(r[I]))); # median absolute deviation
+    u = abs(r/(1.4826*MAD)/sqrt(1-h)); # studentized residuals
+    if wstr == 'cauchy':
+        c = 2.385; W = 1./(1+(u/c)**2); # Cauchy weights
+    elif wstr == 'talworth':
+        c = 2.795; W = u<c; # Talworth weights
+    else:
+        c = 4.685; W = (1-(u/c)**2)**2.*((u/c)<1); # bisquare weights
+
+    W[isnan(W)] = 0;
+    return W
+#############################################################################################
+def dctND(data,f=dct):
+  nd = len(data.shape)
+  if nd == 1:
+    return f(data,norm='ortho',type=2)
+  elif nd == 2:
+    return f(f(data,norm='ortho',type=2).T,norm='ortho',type=2).T
+  elif nd ==3:
+    return f(f(f(data,norm='ortho',type=2,axis=0)\
+                     ,norm='ortho',type=2,axis=1)\
+                     ,norm='ortho',type=2,axis=2)
+##########################################################################################################################################
+##########################################################################################################################################
+##########################################################################################################################################
+if __name__ == "__main__":
+	HDFfiles = glob.glob (HDFolder + "MCD15A2H.A20?????.h??v??.006.*.hdf")
+	Years = [str(y) for y in np.unique([y[55:59] for y in HDFfiles])][4:]
+	#Dates = [str(y) for y in np.unique([y[55:62] for y in HDFfiles])]
+	wcovfile = "C:/MNKAHIU/RESEARCHPAPERS/PEER/WOODCOVER/WC.KENYA.EXTENT.2016.SINUS.500m.tif"
+	precfile = "C:/MNKAHIU/RESEARCHPAPERS/PEER/PRECIP/CHIRPS.KENYA.EXTENT.1990_2019.SINUS.500m.tif"		
+	LAIwmax, TreeChange = incanopyPARAMETERS (wcfile=wcovfile, prfile=precfile,greenUp=8/float(14))
+	WCover  = gdal.Open(wcovfile, gdal.GA_ReadOnly).ReadAsArray().ravel()
+	WCover = np.where(WCover<0, np.nan, WCover)
+	imgba = 8
+	for yr in range(len(Years)):
+		print("\n"+Years[yr])
+		yrange = range((int(Years[yr])-1), (int(Years[yr])+2))
+		yr1 = glob.glob (HDFolder + "MCD15A2H.A" + str(yrange[0]) + "*.006.*.hdf")
+		yr1 = [str(y) for y in np.unique([y[55:62] for y in yr1])]
+		yr1 = yr1[(len(yr1)-imgba):(len(yr1))]
+		yr2 = glob.glob (HDFolder + "MCD15A2H.A" + str(yrange[2]) + "*.006.*.hdf")
+		yr2 = [str(y) for y in np.unique([y[55:62] for y in yr2])][0:imgba]
+		yrc = glob.glob (HDFolder + "MCD15A2H.A" + Years[yr] +"*.006.*.hdf")
+		yrc = [str(y) for y in np.unique([y[55:62] for y in yrc])]
+		flistDATES = yr1+yrc+yr2
+		laiDATA, toDELETE = readingDATES(fldates=flistDATES, Folder = HDFolder, refras=outrefKENYA, tmpDIR=tmpdirtry, clippingExtent=clp)
+		#dltd = [os.remove(ff) for ff in toDELETE]
+		for ff in toDELETE:
+			try:
+				os.remove(ff)
+			except (PermissionError, FileNotFoundError) as e:
+				pass
+		npixels = int(laiDATA.shape[0])
+		nfiles = int(laiDATA.shape[1])
+		aggrLAI = np.zeros((npixels, nfiles))
+		woodLAI = np.zeros((npixels, nfiles))
+		herbLAI = np.zeros((npixels, nfiles))
+		click.secho('\n' + "<<< SMOOTHING AND PARTITIONING STAGE FOR >>>" + "<<< >>>" +  Years[yr], bold=True)
+		for ipixel in tqdm(range(npixels)):
+			sLAI = smoothingDATA(inarray=laiDATA[ipixel,:], window=3, expctdiffce=1, quantyl=0.75)
+			aggrLAI[ipixel,:]  = sLAI
+			if WCover[ipixel]>=80:
+				woodLAI[ipixel,:] = sLAI
+				herbLAI[ipixel,:] = 0
+			else:
+				woodLAI[ipixel,:], herbLAI[ipixel,:] = PartitionLAI(irowLAI = sLAI*.1,incanopyLAI = LAIwmax[ipixel],tchange = TreeChange[ipixel])
+		print ("SAVING SMOOTHED AGGREGATE and PARTITIONED LAI")
+		aggSAVE = saveFILES(aggrLAI[:,8:54], flistnames = flistDATES[8:54],folder=LAIfolder, index = "smoothLAI.tif", refras=outrefKENYA)
+		aggSAVE = saveFILES(woodLAI[:,8:54], flistnames = flistDATES[8:54],folder=LAIfolder, index = "woodLAI.tif",   refras=outrefKENYA)
+		aggSAVE = saveFILES(herbLAI[:,8:54], flistnames = flistDATES[8:54],folder=LAIfolder, index = "herbLAI.tif",   refras=outrefKENYA)
+	
+	
+	
+	
+# np.reshape(outLAD,(cols,rows))
+
+# for ifile in range(len(flist)):
+    # print os.path.basename(flist[ifile]), 2400,2400)
+	# laiMATRIX = np.reshape(smoothLAI[:,ifile], (2400,2400))
+	# laiMATRIX = np.where(np.isnan(laiMATRIX), -100, laiMATRIX)
+    # out = writeRASTER(inHDF=flist[ifile],indata = laiMATRIX, outname = "%s/%s.%s"%(LAIfolder,os.path.basename(flist[ifile])[0:24],"smoothLAI.tif"), driver="GTiff")
+			
+# if __name__ == "__main__":
+	# global log
+	# try:
+		# log = open('PartionLAI.log', "w", 0) # Unbuffered logfile
+		# write_log("INFO", "Starting up script")
+	# except OSError as e:
+		# print "Exception: %s" % e
+		# sys.exit(2)	
+	# greenUp=8/float(14)
+	# for itile in range(nntiles):
+		# TNam=TileName[itile][16:22]
+		# LAIwmax,TreeChange=incanopyLAI(TNam, XYSize)
+		# LAIfiles=["MCD15A2." + dd + "." + TNam +".smLAI.tif" for dd in Dates] 
+		# partitioning=PartitionLAI (irowLAI,LAIwmax,TreeChange,XYSize)
+		# if not partitioning:
+			# write_log("ERROR", "Partitioning Unsuccessfull, ...EXITING")
+			# sys.exit(3)
+		# else:
+			# write_log("CODE Successful", "%s" % partitioning)
+		   	
+
+# laiDATA = readingTILES (hdftile="h21v08", year = "2004", xsize=2400, ysize=2400)
+
+
+
+# ## Processing Data
+# #hqLAILIST = glob.glob("MCD15A2H.A200[3-4]???.h22v08.006.hqLAI.PY.tif")
+
+# #ss=hqLAILIST[0:36]
+# npix = 2400*2400
+# laiMATRIX = np.zeros((npix, len(hqLAILIST)))
+# #for l in range(len(hqLAILIST)):
+# click.secho('\nTQDM', bold=True)
+# for l in tqdm(range(len(hqLAILIST))):
+    # #print hqLAILIST[l]
+    # laiMATRIX[:,l] = gdal.Open(hqLAILIST[l], GA_ReadOnly).ReadAsArray().ravel()
+
+
+# ## Display image 
+    
+# xx=gdal.Open(hqLAILIST[10], GA_ReadOnly).ReadAsArray()
+# xx= xx*.1
+# plt.figure(figsize=(9,9))
+# plt.imshow(xx,interpolation='none',vmax=7)
+# plt.colorbar()
+
+# precip = glob.glob(PRECfolder+ "/chirps-v2.0.2003.??.tif")
+# precDATA =  np.zeros((2400000, len(precip)))
+# for m in range(len(precip)):
+    # print precip[m]
+    # precDATA[:,m] = gdal.Open(precip[m], GA_ReadOnly).ReadAsArray().ravel()
+              
+
+# rndmidx = np.random.randint(npix, size=100)
+
+# np.savetxt("Successful.SmoothnFunction.csc", fltvals, delimiter=",")
+# np.savetxt("LAIsmoothed.SmoothnFunction.csc", outDATAsmootn, delimiter=",")
+
+# np.savetxt("LAIsmoothed.SGolayFunction.csc", outDATAsgolay, delimiter=",")
+       
+# rndmidx = np.random.randint(npix, size=100)
+
+# smoothedDATA,outDATAsmootn,outDATAsgolay,biseDATA, fltvals, laipks,cubicSMOOTH = smoothLAI(inarray = laiMATRIX[rndmidx,:])
+     
+      
+# for j in range(smoothedDATA.shape[0]):
+    # if pd.isnull(laiMATRIX[rndmidx,:][j,]).all()==True:
+        # print "No DATA"
+    # else:
+    	# xaxis = np.arange(int(smoothedDATA.shape[1]))
+    	# peaks = laipks[j]
+       	# plt.figure(figsize=(16, 8))
+    	# plt.plot(xaxis, laiMATRIX[rndmidx,:][j,], "ko", markeredgewidth=15)
+    	# plt.plot(xaxis, biseDATA[j,], "ro", markeredgewidth=6)
+        # plt.plot(xaxis,cubicSMOOTH[j,], color='#4b0082', linewidth=4, marker='h', markerfacecolor='lightgreen', markeredgewidth=2,markersize=12, markevery=3)
+    	# plt.plot(xaxis, smoothedDATA[j,], "g-",linewidth=5)
+    	# plt.plot(xaxis,outDATAsmootn[j,],"b-o",xaxis,outDATAsgolay[j,],"mv", peaks, laiMATRIX[rndmidx,:][j,][peaks], "cD")
+    	# #    plt.plot(xaxis, laiMATRIX[j,], "c^",xaxis, smoothedDATA[j,], "g-",linewidth=3, xaxis,outDATAsmootn[j,],"b*",xaxis,outDATAsgolay[j,],"rv", peaks, laiMATRIX[j,][peaks], "bD")
+    	# plt.legend(['Original','biseDATA','Cubic', 'mergedSGolaySmoothed', 'Smoothn', 'SGolay','LAI Peaks' ])
+    # #	plt.savefig("smoothplot." + str(j) + ".png")
+    	# plt.show()
+
+
+   
+    
+
+    
+# pp = pd.Series(precDATA[200000,])
+# pp = pp.interpolate(limit_direction='both', kind='cubic')
+# x= arange(len(pp))
+# plt.figure(figsize=(16, 8)) 
+# plt.plot(x, pp, "k-",x,precDATA[200000,],"rv")
+# plt.show()
+
+
+# import scipy.stats as stats
+# import statsmodels.api as sm
+# lowess = sm.nonparametric.lowess
+# x = np.random.uniform(low = -2*np.pi, high = 2*np.pi, size=500)
+# y = np.sin(x) + stats.cauchy.rvs(size=len(x))
+# z = lowess(y, x, frac= 1./3, it=0)
+# w = lowess(y, x, frac=1./3)
+
+# #pip install --user loess
+
+# #{sys.executable} -m ensurepip --default-pip
+
+# #{sys.executable} -m pip install --upgrade pip setuptools wheel
+
+
+
+
+
+
+# x= np.array((np.arange(0,100)))
+# for i in range(len(x)):
+	# try:
+		# tt = 0/x[i]
+		# print tt
+    # except ZeroDivisionError:
+        # pass
+		
+		
